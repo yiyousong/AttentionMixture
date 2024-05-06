@@ -12,25 +12,31 @@ import diffusers
 from mamba_ssm import Mamba
 from einops.layers.torch import Rearrange, Reduce
 from typing import Union, List
+
 class AttentionMixture(nn.Module):
     '''
     further reduce K and V
     compressing Q using SoftMixture requires S*s*d*G*h, h times higher than modifing K or V.
     only compressing K and V does not change original length (or maybe we should compress Sequence length for all layers by compressing Q?)
     Computation cost: MHSA>>Q to Qcomp=Q@Kcomp=Qcomp@K>K to Kcomp>>Qcomp@Kcomp
-    compressing only K is more effiecient.
     '''
     def __init__(self,inputsize=512,decoder_inputsize=None,groupnum=8,headspergroup=16,
-                 dim=None,qkdim=128,vdim=128,ffoutsize=None,ffdropout=0.1,attdropout=0.25,latent_length=100,softmaxdim='both',latent_softmax_weight=1):
+                 dim=None,qkdim=128,vdim=128,ffoutsize=None,ffdropout=0.25,attdropout=0.25,latent_length=100,softmaxdim='both',latent_softmax_weight=1.0,latent_softmax_weightp=True):
         super(AttentionMixture, self).__init__()
         self.Rearrange=Rearrange('b d s ->b s d')
         self.latent_length=latent_length
         self.softmaxdim=softmaxdim
-        self.latent_softmax_weight=latent_softmax_weight# maybe increase this if you believe many tokens are less important.
+        if latent_softmax_weightp:
+            self.latent_softmax_weight=torch.nn.parameter.Parameter(torch.as_tensor(latent_softmax_weight).float())
+        else:
+            self.latent_softmax_weight = latent_softmax_weight  # maybe increase this if you believe many tokens are less important.
         if decoder_inputsize==None:
             decoder_inputsize=inputsize
         if ffoutsize is None:
             ffoutsize=inputsize
+            self.res=True
+        else:
+            self.res=False
         self.attdropout = nn.Dropout(attdropout)  # this is flawed as after dropout weight does not sum to one, but I didn't found a way to efficiently modify tensor inplace
         if dim is not None:
             qkdim,vdim=dim,dim
@@ -52,8 +58,9 @@ class AttentionMixture(nn.Module):
             nn.Linear(ffoutsize*2,ffoutsize),
             nn.SiLU(),
             nn.Dropout(ffdropout))
-        self.attweight=nn.Sequential(nn.Linear(output_size,latent_length),nn.SiLU(),nn.Linear(latent_length,latent_length))
-    def forward(self,x,m=None):
+        self.attweight=nn.Sequential(nn.Linear(qkdim,latent_length),nn.SiLU(),nn.Linear(latent_length,latent_length))
+        # self.attweight=nn.Linear(qkdim,latent_length)
+    def forward(self,x,m=None,return_attention=False):
 
         assert len(x.size())>2
         x=self.norm(x)
@@ -68,30 +75,31 @@ class AttentionMixture(nn.Module):
         ksize=msize[:-1]+[self.groupnum, self.qkdim]
         vsize=msize[:-1]+[self.groupnum, self.vdim]
         kv=self.Wkv(m)
-        k,v=kv.split([self.qkdim,self.vdim],dim=-1)
+        k,v=kv.split([self.groupnum*self.qkdim,self.groupnum*self.vdim],dim=-1)
+        k = k.contiguous().view(ksize)
+        v = v.contiguous().view(vsize)
         q = self.Wq(x).contiguous().view(qsize)
         weights=self.attweight(k)
         if self.softmaxdim=='both':
-            weight1=F.softmax(weights,dim=-1)/length
-            weight2=F.softmax(weights,dim=-2)/self.latent_length*self.latent_softmax_weight
+            weight1=F.softmax(weights,dim=-1)*self.latent_length/length
+            weight2=F.softmax(weights,dim=-2)*self.latent_softmax_weight
             weights=(weight1+weight2)/(1+self.latent_softmax_weight)
         elif self.softmaxdim==-1:
-            weights=F.softmax(weights,dim=-1)/length
+            weights=F.softmax(weights,dim=-1)*self.latent_length/length
         elif self.softmaxdim==-2:
-            weights=F.softmax(weights,dim=-2)/self.latent_length
+            weights=F.softmax(weights,dim=-2)
         else:
             raise NotImplementedError
-        k=einops.einsum(k,weights,'b s d, b s S -> b S d ')
-        v=einops.einsum(v,weights,'b s d, b s S -> b S d ')
-        k = k.contiguous().view(ksize)
-        v = v.contiguous().view(vsize)
-
+        k=einops.einsum(k,weights,'b s g d, b s g S -> b S g d ')
+        v=einops.einsum(v,weights,'b s g d, b s g S -> b S g d ')
         qk=einops.einsum(q,k,'... s g h d,... S g d -> ... g h s S')
         qk = self.softmax(torch.mul(qk, self.size))
         qk=self.attdropout(qk)
         z=einops.einsum(qk,v,'... g h s S,... S g d->... s g h d')
         z=z.flatten(-3)
         out=self.Wz(z)
+        if self.res:
+            out=out+x
         if return_attention:
             return out,weight
         else:
